@@ -11,19 +11,12 @@
 #include <fcntl.h>
 
 #define RCVPORT 38199
-#define FUNC(x) x *x // В примере я буду вычислять интеграл от x^2
-
-// Структура для передачи задания серверу
-typedef struct {
-	int limits;
-	int numoftry;
-} task_data_t;
 
 // Аргумент функции треда вычислителя
 typedef struct {
-	int limits; // Предел интегрирования
-	long numoftry; // Количество попыток которые должен выполнить тред
-	long double *results; // Куда записать результат
+	int elements_count;
+	long long *elements;
+	long long *results; // Куда записать результат
 } thread_args_t;
 
 // Функция треда вычислителя
@@ -31,15 +24,12 @@ void *calculate(void *arg)
 {
 	// Ожидаем в качестве аргумента указатель на структуру thread_args_t
 	thread_args_t *tinfo = (thread_args_t *)arg;
-	long double result = 0;
-	int xlim = tinfo->limits;
-	int trys = tinfo->numoftry;
-	unsigned a = xlim;
-	for (int i = 0; i < trys; ++i) {
-		int div = rand_r(&a);
-		int div2 = rand_r(&a);
-		double x = div % xlim + (div2 / (div2 * 1.0 + div * 1.0));
-		result += FUNC(x);
+	long long result = tinfo->elements[0];
+	for (int i = 1; i < tinfo->elements_count; ++i) {
+		long long cur = tinfo->elements[i];
+		if (cur > result) {
+			result = cur;
+		}
 	}
 	*(tinfo->results) = result;
 	return NULL;
@@ -133,7 +123,7 @@ void *listen_broadcast(void *arg)
 				      MSG_TRUNC, (struct sockaddr *)&client,
 				      &servaddrlen);
 		if (rdbyte == msgsize &&
-		    strcmp(hellomesg, "Hello Integral") == 0 && *isbusy == 0) {
+		    strcmp(hellomesg, "Hello Server") == 0 && *isbusy == 0) {
 			if (sendto(sockbrcast, helloanswer, msgsize, 0,
 				   (struct sockaddr *)&client,
 				   sizeof(struct sockaddr_in)) < 0) {
@@ -241,10 +231,34 @@ int main(int argc, char **argv)
 		}
 
 		isbusy = 1; // Запрещаем отвечать на запросы
-		task_data_t data;
-		int read_bytes = recv(client, &data, sizeof(data), 0);
-		if (read_bytes != sizeof(data) || data.limits < 1 ||
-		    data.numoftry < 1) {
+		int ok = 1;
+		int elements_count;
+		long long *elements;
+		int read_bytes = recv(client, &elements_count,
+				      sizeof(elements_count), 0);
+		if (read_bytes != sizeof(elements_count) ||
+		    elements_count < 1) {
+			ok = 0;
+		} else {
+			elements = (long long *)malloc(sizeof(long long) *
+						       elements_count);
+			long long left_to_recv =
+				sizeof(long long) * elements_count;
+			char *recv_ptr = (char *)elements;
+			while (left_to_recv) {
+				int recved =
+					recv(client, recv_ptr, left_to_recv, 0);
+				if (recved <= 0) {
+					ok = 0;
+					break;
+				}
+				recv_ptr += recved;
+				left_to_recv -= recved;
+			}
+            if (left_to_recv != 0)
+                ok = 0;
+		}
+		if (!ok) {
 			fprintf(stderr,
 				"Invalid data from %s on port %d, reset peer\n",
 				inet_ntoa(addrclient.sin_addr),
@@ -253,24 +267,34 @@ int main(int argc, char **argv)
 			isbusy = 0;
 		} else {
 			fprintf(stdout,
-				"New task from %s on port %d\nlimits: %d\n"
-				"numoftrys: %d\n",
+				"New task from %s on port %d\narray size: %d\n",
 				inet_ntoa(addrclient.sin_addr),
-				ntohs(addrclient.sin_port), data.limits,
-				data.numoftry);
+				ntohs(addrclient.sin_port), elements_count);
+			int threads_per_task = numofthread;
+			if (threads_per_task > elements_count) {
+				threads_per_task = elements_count;
+			}
 			thread_args_t *tinfo;
 			pthread_t *calc_threads = (pthread_t *)malloc(
-				sizeof(pthread_t) * numofthread);
-			int threads_trys = data.numoftry % numofthread;
-			long double *results = (long double *)malloc(
-				sizeof(long double) * numofthread);
+				sizeof(pthread_t) * threads_per_task);
+			long long *results = (long long *)malloc(
+				sizeof(long long) * threads_per_task);
 			tinfo = (thread_args_t *)malloc(sizeof(thread_args_t) *
-							numofthread);
+							threads_per_task);
 			// Создаем вычислительные треды
-			int numofthreadtry = data.numoftry / numofthread + 1;
-			for (int i = 0; i < numofthread; ++i) {
-				tinfo[i].limits = data.limits;
-				tinfo[i].numoftry = numofthreadtry;
+			int count_per_thread =
+				elements_count / threads_per_task;
+			for (int i = 0; i < threads_per_task; ++i) {
+				if (i < threads_per_task - 1) {
+					tinfo[i].elements_count =
+						count_per_thread;
+				} else {
+					tinfo[i].elements_count =
+						elements_count -
+						i * count_per_thread;
+				}
+				tinfo[i].elements =
+					elements + i * count_per_thread;
 				tinfo[i].results = &results[i];
 				if (pthread_create(&calc_threads[i], NULL,
 						   calculate, &tinfo[i]) != 0) {
@@ -285,7 +309,7 @@ int main(int argc, char **argv)
 			// Создаем тред проверяющий соединение с клиентом
 			checker_args_t checker_arg;
 			checker_arg.calcthreads = calc_threads;
-			checker_arg.threadnum = numofthread;
+			checker_arg.threadnum = threads_per_task;
 			checker_arg.sock = client;
 			pthread_t checker_thread;
 			if (pthread_create(&checker_thread, NULL, client_check,
@@ -296,21 +320,22 @@ int main(int argc, char **argv)
 			}
 			int iscanceled = 0; // Почему завершились треды?
 			int *exitstat;
-			for (int i = 0; i < numofthread; ++i) {
+			for (int i = 0; i < threads_per_task; ++i) {
 				pthread_join(calc_threads[i],
 					     (void *)&exitstat);
 				if (exitstat == PTHREAD_CANCELED)
 					iscanceled = 1; // Отменили их
 			}
 			if (iscanceled != 1) {
-				long double *res = (long double *)malloc(
-					sizeof(long double));
-				bzero(res, sizeof(long double));
-				*res = 0.0;
-				for (int i = 0; i < numofthread; ++i)
-					*res += results[i];
+				long long *res =
+					(long long *)malloc(sizeof(long long));
+				bzero(res, sizeof(long long));
+				*res = results[0];
+				for (int i = 1; i < threads_per_task; ++i)
+					*res = results[i] > *res ? results[i] :
+								   *res;
 				pthread_kill(checker_thread, SIGUSR1);
-				if (send(client, res, sizeof(long double), 0) <
+				if (send(client, res, sizeof(long long), 0) <
 				    0) {
 					perror("Sending error");
 				}

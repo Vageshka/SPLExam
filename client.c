@@ -9,19 +9,13 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 
-// Структура для отправки задания серверу
-typedef struct {
-	int limits;
-	int numoftry;
-} task_data_t;
-
 // Аргумент для треда работающего с сервером
 typedef struct {
-	int limits; // Пределы
-	int numoftry; // Количество попыток для сервера
+	int elements_count; // Пределы
+	long long *elements; // Количество попыток для сервера
 	struct sockaddr_in
 		*server; // Структура с информацией для подключения к серверу
-	long double *results; // Куда записать результат
+	long long *results; // Куда записать результат
 } thread_args_t;
 
 // Функция треда работающего с сервером
@@ -49,14 +43,28 @@ void *send_thread(void *arg)
 		perror("Connect to server failed!");
 		exit(EXIT_FAILURE);
 	}
-	task_data_t senddata;
-	senddata.limits = task_data->limits;
-	senddata.numoftry = task_data->numoftry;
 
-	if (send(servsock, &senddata, sizeof(senddata), 0) < 0) {
-		perror("Sending data to server failed");
-		exit(EXIT_FAILURE);
+    int ok = 1;
+	if (send(servsock, &task_data->elements_count,
+		 sizeof(task_data->elements_count), 0) < 0) {
+		ok = 0;
 	}
+	long long left_to_send =
+		sizeof(long long) * task_data->elements_count;
+	char *send_ptr = (char *)task_data->elements;
+	while (left_to_send) {
+		int sent = send(servsock, send_ptr, left_to_send, 0);
+		if (sent <= 0) {
+			ok = 0;
+            break;
+		}
+		send_ptr += sent;
+		left_to_send -= sent;
+	}
+    if(!ok || left_to_send != 0) {
+        perror("Sending data to server failed");
+		exit(EXIT_FAILURE);
+    }
 
 	int recv_byte =
 		recv(servsock, task_data->results, sizeof(long double), 0);
@@ -75,31 +83,47 @@ void *send_thread(void *arg)
 
 int main(int argc, char **argv)
 {
-	if (argc < 3) {
-		fprintf(stderr, "Usage: %s limits numoftry [maxserv]\n",
-			argv[0]);
+	if (argc < 2) {
+		fprintf(stderr, "Usage: %s filename [maxserv]\n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
 
-	int numoftry = atoi(argv[2]);
-	if (numoftry == 0) {
-		fprintf(stderr, "Num of try is invalid\n");
-		exit(EXIT_FAILURE);
-	}
 	int maxservu = 1000000;
-	if (argc == 4) {
-		maxservu = atoi(argv[3]);
+	if (argc == 3) {
+		maxservu = atoi(argv[2]);
 		if (maxservu < 1) {
 			fprintf(stderr, "Error number of max servers\n");
 			exit(EXIT_FAILURE);
 		}
 	}
-	int limits = atoi(argv[1]);
-	if (limits == 0) {
-		fprintf(stderr, "Limits is invalid\n");
+	char *filename = argv[1];
+	int filed = open(filename, O_RDONLY);
+	if (filed == -1) {
+		perror("Can not open file!");
 		exit(EXIT_FAILURE);
 	}
-
+	long long *digits = (long long *)malloc(sizeof(long long));
+	int array_size = 1;
+	FILE *file = fdopen(filed, "r");
+	long long digit = 0;
+	fscanf(file, "%lld", &digit);
+	while (!feof(file)) {
+		digits = realloc(digits, sizeof(long long) * array_size);
+        digits[array_size - 1] = digit;
+		array_size++;
+		fscanf(file, "%lld", &digit);
+	}
+	fclose(file);
+	close(filed);
+	if (--array_size < 2) {
+		if (array_size) {
+			fprintf(stdout, "Max = %lld\n", digits[0]);
+		} else {
+			fprintf(stdout, "File is empty\n");
+		}
+		free(digits);
+		exit(EXIT_SUCCESS);
+	}
 	// Создаем сокет для работы с broadcast
 	int sockbrcast = socket(PF_INET, SOCK_DGRAM, 0);
 	if (sockbrcast == -1) {
@@ -141,7 +165,7 @@ int main(int argc, char **argv)
 	int msgsize = sizeof(char) * 18;
 	void *hellomesg = malloc(msgsize);
 	bzero(hellomesg, msgsize);
-	strcpy(hellomesg, "Hello Integral");
+	strcpy(hellomesg, "Hello Server");
 	// Посылаем broadcast
 	if (sendto(sockbrcast, hellomesg, msgsize, 0,
 		   (struct sockaddr *)&addrbrcast_snd,
@@ -211,15 +235,24 @@ int main(int argc, char **argv)
 	printf("\n");
 	free(hellomesg);
 
-	long double *results =
-		(long double *)malloc(sizeof(long double) * servcount);
+	if (servcount > 2 * array_size) {
+		servcount = array_size / 2;
+	}
+	long long *results = (long long *)malloc(sizeof(long long) * servcount);
 	// Создаем треды для работы с серверами
 	pthread_t *tid = (pthread_t *)malloc(sizeof(pthread_t) * servcount);
+	//
+	int count_per_server = array_size / servcount;
 	for (i = 0; i < servcount; ++i) {
 		thread_args_t *args =
 			(thread_args_t *)malloc(sizeof(thread_args_t));
-		args->limits = limits;
-		args->numoftry = numoftry / servcount + 1;
+		if (i < servcount - 1) {
+			args->elements_count = count_per_server;
+		} else {
+			args->elements_count =
+				array_size - i * count_per_server;
+		}
+		args->elements = digits + i * count_per_server;
 		args->results = &results[i];
 		args->server = &servers[i];
 
@@ -228,18 +261,17 @@ int main(int argc, char **argv)
 			exit(EXIT_FAILURE);
 		}
 	}
-	long double res = 0;
 	// Ждем все сервера
 	for (i = 0; i < servcount; ++i)
 		pthread_join(tid[i], NULL);
 
 	// Вычисляем результат
-	for (i = 0; i < servcount; ++i)
-		res += results[i];
-	res /= numoftry;
-	res *= limits;
+	long long res = results[0];
+	for (i = 1; i < servcount; ++i)
+		res = results[i] > res ? results[i] : res;
 
 	free(servers);
-	printf("\nResult: %Lf\n", res);
+	free(digits);
+	printf("\nResult: %lld\n", res);
 	return (EXIT_SUCCESS);
 }
